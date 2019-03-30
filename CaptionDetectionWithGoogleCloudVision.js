@@ -5,14 +5,12 @@ main = async () => {
 
     const fileName = "calvinhobbespic.gif";
     const fileNameNoText = "calvinsledex2.png";
-    const fileNameMultipleText = "calvinhobbes2captions7.jpg";
-
-    const curFileName = fileNameMultipleText; 
+    const fileNameMultipleText = "calvinhobbes2captions.jpg"; 
 
     console.log("DEBUG: Detecting text");
 
     // Performs text detection on the image file
-    const [result] = await client.textDetection(curFileName);
+    const [result] = await client.textDetection(fileName);
     if(result.textAnnotations.length == 0) {
         console.log("DEBUG: No text found");
         return JSON.stringify({
@@ -22,29 +20,21 @@ main = async () => {
     }
     const detections = result.textAnnotations;
     
-    var captions = [];
+    var captions = new Array(2);
     captions.push(new Array());
     captions.push(new Array());
 
     var captionLastPlacedWordIndexArr = new Array(2);
     var captionFurthestX = new Array(2);
-
     
-    var caption1;
+    var caption1, caption1BottomRightX, caption1BottomRightY;
     const caption1Vertical = detections[1]["boundingPoly"]["vertices"][0]["x"];
     var caption1TopLeftX = caption1Vertical;
     var caption1TopLeftY = detections[1]["boundingPoly"]["vertices"][0]["y"];
-    var caption1BottomRightX;
-    var caption1BottomRightY;
     captionLastPlacedWordIndexArr[0] = 1;
     captionFurthestX[0] = detections[1]["boundingPoly"]["vertices"][2]["x"];
 
-    var caption2;
-    var caption2Vertical;
-    var caption2TopLeftX;
-    var caption2TopLeftY;
-    var caption2BottomRightX;
-    var caption2BottomRightY;
+    var caption2, caption2Vertical, caption2TopLeftX, caption2TopLeftY, caption2BottomRightX, caption2BottomRightY;
 
     //collect total spacing between words for average
     var totalXSpacing = 0;
@@ -75,9 +65,35 @@ main = async () => {
         );
 
 
-    // if spacing greater than a specified average line spacing, probably multiple captions        
+    /* 
+        if spacing greater than a specified average line spacing, probably multiple captions     
+        
+        (ex) threshold = 1
+         ____________________________________________________
+        |                                                    |
+        | "example caption one"                              |
+        |                              "example caption two" |
+        |____________________________________________________|
+
+                  ^       ^    ^^^^^^^^        ^       ^
+                  1       1       8         1       1
+
+                  avg = (1 + 1 + 8 + 1 + 1) / 6 = 2   ( > 1 )----> multiple
+        
+         ____________________________________________________
+        |                                                    |
+        |           "Lorem ipsum dolor sit                   |
+        |            consectetur adipiscing"                 |
+        |____________________________________________________|
+
+                          ^     ^     ^
+                          1     2     1
+
+                  avg = (1 + 2 + 1) / 6 = 2/3         ( < 1 )----> multiple
+    */
     if(wordDistanceThreshold > expectedWordDistanceThresholdSingleCaption) {
         console.log("DEBUG: Multiple captions detected");
+        console.log("DEBUG: Full Text : " + detections[0]["description"].replace(new RegExp("\n", 'g'), "\\n"));
         var captionSelected = 0;
         
         //sort words into their proper caption

@@ -1,11 +1,13 @@
+// Ben Mesnik
+
 main = async () => {
     const vision = require('@google-cloud/vision');
     
     const client = new vision.ImageAnnotatorClient();
 
-    const fileName = "calvinhobbespic.gif";
+    const fileName = "calvinhobbespic3.jpg";
     const fileNameNoText = "calvinsledex2.png";
-    const fileNameMultipleText = "calvinhobbes2captions.jpg"; 
+    const fileNameMultipleText = "calvinhobbes2captions8.jpg"; 
 
     console.log("DEBUG: Detecting text");
 
@@ -21,8 +23,8 @@ main = async () => {
     const detections = result.textAnnotations;
     
     var captions = new Array(2);
-    captions.push(new Array());
-    captions.push(new Array());
+    captions[0] = new Array();
+    captions[1] = new Array();
 
     var captionLastPlacedWordIndexArr = new Array(2);
     var captionFurthestX = new Array(2);
@@ -157,7 +159,9 @@ main = async () => {
 
     } else {
         console.log("DEBUG: One caption found");
-        caption1 = detections[0]["description"];
+        caption1 = detections[0]["description"].replace(new RegExp("\n", 'g'), " ").toLocaleLowerCase();
+        caption1BottomRightX = detections[0]["boundingPoly"]["vertices"][2]["x"];
+        caption1BottomRightY = detections[0]["boundingPoly"]["vertices"][2]["y"];
     }
 
     console.log('RESULT:');

@@ -91,7 +91,7 @@ main = async () => {
                           ^     ^     ^
                           1     2     1
 
-                  avg = (1 + 2 + 1) / 6 = 2/3         ( < 1 )----> multiple
+                  avg = (1 + 2 + 1) / 6 = 2/3         ( < 1 )----> single
     */
     if(wordDistanceThreshold > expectedWordDistanceThresholdSingleCaption) {
         console.log("DEBUG: Multiple captions detected");
@@ -128,9 +128,6 @@ main = async () => {
                 }
                 captionSelected = 1;
             } else if(spaceBeforeCurWord > wordDistanceThreshold / 2) {
-                //console.log(text["description"]);
-                //console.log(Math.abs(caption1Vertical - curWordLeftXCo))
-                //console.log(Math.abs(caption2Vertical - curWordLeftXCo))
                 if(Math.abs(caption1Vertical - curWordLeftXCo) < Math.abs(caption2Vertical - curWordLeftXCo)) {
                     captionSelected = 0;
                 } else {

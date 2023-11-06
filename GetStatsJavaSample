@@ -1,0 +1,131 @@
+...
+
+	private static Response getStatsImpl(String regionUnused, String puuid, String userId, String gameMode) {
+		if (gameMode.equals("null")) {
+			gameMode = "bomb";
+		}
+		if(puuid == null || !GAME_MODE_TO_API_GAME_MODE.containsKey(gameMode)) return Response.status(ServletContextClass.SERVER_ERROR).build();
+		JSONObject result = new JSONObject();
+		Boolean success = false;
+
+		try {
+			// Fetch stats and tip view data from our database
+			JSONObject playerStatsHistory = getStatsForPlayerFromDB(puuid, gameMode);
+			JSONObject playerTipViewData = getTipViewDataForPlayerFromDB(userId);
+
+			// Set defaults if this is the first time fetching a users stats
+			if (playerStatsHistory == null) {
+				playerStatsHistory = new JSONObject();
+				playerStatsHistory.put("lastMatchCounted", "");
+				playerStatsHistory.put("lastTimeRefreshed", -1);
+				JSONObject emptyLastTenMatches = new JSONObject();
+				emptyLastTenMatches.put("statsTotalsLast3Matches", new JSONObject());
+				emptyLastTenMatches.put("statsTotalsLast10Matches", new JSONObject());
+				emptyLastTenMatches.put("cache", new JSONArray());
+				playerStatsHistory.put("recentMatches", emptyLastTenMatches);
+
+				// find region to use for player
+				playerStatsHistory.put("region", findRegionForPlayer(puuid));
+			} else if (!playerStatsHistory.has("region") || playerStatsHistory.getString("region") == null) {
+				// Try getting reaching again if the first attempt didn't work on a previous call
+				playerStatsHistory.put("region", findRegionForPlayer(puuid));
+			}
+
+			// Combine tip view data with the player stats data
+			playerStatsHistory.put("tipViewData", playerTipViewData);
+
+			String region = playerStatsHistory.getString("region");
+			JSONArray matchHistoryArray = getMatchHistoryForPlayer(puuid, region, gameMode);
+
+			// Loop through all the players match history, get the stats for new matches, store the most recent (Up to Ten) uncounted matches to a buffer, need to reverse order the buffer later
+			JSONArray newLastTenMatches = new JSONArray();
+			boolean isNewMatch = false;
+			boolean lastMatchCountedExistsInHistory = false;
+
+			// Do one loop through 1st to see if the last match counted exists in the history, if not Add all matches, history might have been reset with new act
+			if (!playerStatsHistory.getString("lastMatchCounted").equals("")) {
+				for (int i = Math.min(MAX_NUM_MATCHES - 1, matchHistoryArray.length() - 1); i >= 0; i--) {
+					String matchId = matchHistoryArray.getJSONObject(i).getString("matchId");
+					if (playerStatsHistory.getString("lastMatchCounted").equals(matchId)) {
+						lastMatchCountedExistsInHistory = true;
+						break;
+					}
+				}
+			}
+
+			for (int i = Math.min(MAX_NUM_MATCHES - 1, matchHistoryArray.length() - 1); i >= 0; i--) {
+				String matchId = matchHistoryArray.getJSONObject(i).getString("matchId");
+				if (playerStatsHistory.getString("lastMatchCounted").equals("") || !lastMatchCountedExistsInHistory) {
+					isNewMatch = true;
+				} else if (playerStatsHistory.getString("lastMatchCounted").equals(matchId)) {
+					isNewMatch = true;
+					continue;
+				}
+				if (isNewMatch) {
+					try {
+						// Get stats from Riot API, break if there was an error or if the rate limit was exceeded
+						JSONObject matchStats = getStatsForPlayerFromMatch(matchId, puuid, region, gameMode);
+						newLastTenMatches.put(matchStats);
+						playerStatsHistory.put("lastMatchCounted", matchId);
+						playerStatsHistory.put("lastTimeRefreshed", matchStats.getLong("gameStartMillis") + matchStats.getInt("gameLengthMillis"));
+					} catch (Exception e) {
+						System.out.println("rate limit exceeded? or riot stats api changed?");
+						e.printStackTrace();
+						System.out.println(e.getMessage());
+						break;
+					}
+				}
+			}
+
+			// Put together a buffer of all the uncounted matches in the last Ten matches (above)
+			// Concat all the previous recent matches to be persisted and cut off the excess past Ten
+			List<Object> newLastTenMatchesList = newLastTenMatches.toList();
+			Collections.reverse(newLastTenMatchesList);
+			List<Object> lastTenMatches = playerStatsHistory.getJSONObject("recentMatches").getJSONArray("cache").toList();
+			newLastTenMatchesList.addAll(lastTenMatches);
+			newLastTenMatchesList = newLastTenMatchesList.subList(0, Math.min(MAX_NUM_MATCHES, newLastTenMatchesList.size()));
+
+			// No matches exist for the player
+			if (newLastTenMatches.length() + lastTenMatches.size() == 0) {
+				JSONObject retval = BLANK_PLAYER_STATS;
+				retval.getJSONObject("playerStats").put("tipViewData", playerTipViewData); // attach dynamic tip view count
+				return Response.status(201).entity(retval.toString()).build();
+			}
+
+			// Construct database record for last Ten matches
+			JSONArray updatedLastTenMatches = new JSONArray(newLastTenMatchesList);
+			JSONArray updatedLastThreeMatches = new JSONArray(newLastTenMatchesList.subList(0, Math.min(3, newLastTenMatchesList.size())));
+			JSONObject updatedLastTenMatchesRecord = new JSONObject();
+			updatedLastTenMatchesRecord.put("statsTotalsLast3Matches", calculateTotalsFromMatchList(updatedLastThreeMatches));
+			updatedLastTenMatchesRecord.put("statsTotalsLast10Matches", calculateTotalsFromMatchList(updatedLastTenMatches));
+			updatedLastTenMatchesRecord.put("cache", updatedLastTenMatches);
+
+			playerStatsHistory.put("recentMatches", updatedLastTenMatchesRecord);
+
+			// Add additional analysis based on player data
+			JSONObject analysis = new JSONObject();
+
+			if (userId != null && (userId.equals("82a0c837-f5b5-57fa-8643-d07b2bd97eec") || userId.equals("8b9a2470-3758-54b5-9f76-b1fe8f6f8f95") || userId.equals("284d2f69-eca4-5422-8f0a-16740cd4ac45") || userId.equals("f9ba8ed5-c96e-5d13-8f1e-31e448e31901") || userId.equals("c49455ca-2744-555f-b24c-820711650425") || userId.equals("4b61643c-e5d3-5cf9-9d72-8ff62c67423b") || userId.equals("7cc58acd-2e50-5831-a544-6306127c2737"))) {
+				analysis.put("opScore", 999);
+			} else {
+				analysis.put("opScore", calcOPScore(playerStatsHistory));
+			}
+			analysis.put("ppScore", calcPPScore(playerStatsHistory));
+			playerStatsHistory.put("analysis", analysis);
+
+			// Save results to database and return them
+			saveStatsForPlayerToDB(puuid, playerStatsHistory, gameMode);
+			result.put("playerStats", playerStatsHistory);
+
+			success = true;
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+
+		return Response.status(success ? 200 : 501)
+				.header("Access-Control-Allow-Origin", "*")
+				.entity(result.toString())
+				.build();
+	}
+
+...

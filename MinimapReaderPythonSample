@@ -1,0 +1,222 @@
+import logging
+import json
+import random
+import sys
+import threading
+import time
+import urllib.request
+from os import listdir, path
+from time import sleep
+
+import numpy as np
+import requests
+
+from image_search import *
+
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+cur_map = "dust_2"
+allowed_gen_locs = set()
+teammate_minimap_threshold = [0, 15, 55, 90, 120]
+enemy_minimap_threshold = [10, 60, 140, 220, 310]
+
+# load files to memory
+def load_locations():
+    game_data_filepath = "./game_data/csgo.json"
+    locations_list = {}
+    try:
+        with open(game_data_filepath) as f:
+            data = json.load(f)
+            locations_data = data["locations"][cur_map]
+    except:
+        print("ERROR: Can not open/read file with locations data.")
+        return {}
+    
+    for gen_loc in locations_data:
+        allowed_gen_locs.add(gen_loc)
+        locations_list[gen_loc] = {}
+        for i, spec_loc in enumerate(locations_data[gen_loc]):
+            #print(spec_loc)
+            locations_list[gen_loc][i] = [None] * 4
+            locations_list[gen_loc][i][0] = spec_loc
+            locations_list[gen_loc][i][1] = []         # minimap images that clarify area
+            locations_list[gen_loc][i][2] = []         # minimap images that clarify area img names
+            
+            # load spec_loc?/clarification images
+            cur_path = "./game_data/locations/{}/{}/{}".format(cur_map, gen_loc, spec_loc)
+            files = [img_name for img_name in listdir(cur_path) if path.isfile(cur_path + "/" + img_name)]
+            for img_name in files : 
+                image = load_image_from_file("./game_data/locations/{}/{}/{}/{}".format(cur_map, gen_loc, spec_loc, img_name))
+                locations_list[gen_loc][i][1].append(image)
+                locations_list[gen_loc][i][2].append(img_name)
+                
+
+            # load scenario images
+            locations_list[gen_loc][i][3] = {}
+            cur_path = "./game_data/locations/{}/{}/{}/scenarios/".format(cur_map, gen_loc, spec_loc)
+            if(spec_loc == "close door") :
+                for scenario_folder_name in listdir(cur_path) :        
+                    locations_list[gen_loc][i][3][scenario_folder_name] = {}
+                    for scenario in listdir(cur_path + "/" + scenario_folder_name) :
+                        locations_list[gen_loc][i][3][scenario_folder_name][scenario[0]] = load_image_from_file("./game_data/locations/{}/{}/{}/scenarios/{}/{}".format(cur_map, gen_loc, spec_loc, scenario_folder_name, scenario))
+            
+    return locations_list
+
+# common pixel functions
+def extract_teammates(img) :
+    source = img.split()
+    redBand = source[0].point(lambda i: i == 203 and 255)
+    greenBand = source[1].point(lambda i: i == 223 and 255)
+    blueBand = source[2].point(lambda i: i == 223 and 255)
+    return Image.merge("RGB", (redBand, greenBand, blueBand))
+    
+
+def extract_enemies(img) :
+    source = img.split()
+    redBand = source[0].point(lambda i: i > 205 and 255)
+    greenBand = source[1].point(lambda i: i < 25 and 255)
+    blueBand = source[2].point(lambda i: i < 25 and 255)
+    return Image.merge("RGB", (redBand, greenBand, blueBand))
+
+def calc_white_overlap(img_arr_1, img_arr_2) :
+    #given two numpy array images, calculate white overlap (where both images are set to white/black only)
+    return len(np.column_stack(np.where(np.logical_and.reduce([img_arr_1[:,:,0] == 255, img_arr_1[:,:,1] == 255, img_arr_1[:,:,2] == 255, img_arr_2[:,:,0] == 255, img_arr_2[:,:,1] == 255, img_arr_2[:,:,2] == 255]))))
+
+locations_list = load_locations()    
+
+@app.route('/detect_location', methods=['POST'])
+def detect_location() :
+    scenarios = {
+            "a" : {
+                "teammate_count" : -1,
+                "enemy_count" : -1,
+            },
+            "b" : {
+                "teammate_count" : -1,
+                "enemy_count" : -1,
+            },
+            "c" : {
+                "teammate_count" : -1,
+                "enemy_count" : -1,
+            },
+            "d" : {
+                "teammate_count" : -1,
+                "enemy_count" : -1,
+            },
+            "e" : {
+                "teammate_count" : -1,
+                "enemy_count" : -1,
+            },
+            "f" : {
+                "teammate_count" : -1,
+                "enemy_count" : -1,
+            }
+        }
+    try :
+        gen_loc = request.form["gen_loc"]
+        similarity_arr = [None] * len(locations_list[gen_loc])
+        image_to_check = Image.open(request.files['minimap_img'])
+        image_to_check_skeleton = np.array(image_to_check.point(lambda i: i < 5 and 255))
+        top_similarity = .3 #28 #higher number can weed out false positives
+        spec_loc = ""
+        spec_loc_index = 0
+        spec_loc_img_name_index = 0
+        
+        sim_total = 0
+        sim_count = 0
+        precision = 2  # might want to correlate precision to total images, if there are only a few locations the outlier won't be as much above the avg
+        #collect avg
+        for i in locations_list[gen_loc]:
+            similarity_arr[i] = []
+            for img in locations_list[gen_loc][i][1]:
+                cur_sim = search_image_similarity(img, image_to_check_skeleton)
+                similarity_arr[i].append(cur_sim)
+                sim_total += cur_sim
+                sim_count += 1    
+            
+        similarity_threshold = (sim_total / sim_count) * precision    
+        #find if outlier above threshold ( mean * some percentage to guarantee an outlier)
+        for i, sim_arr_for_spec_loc in enumerate(similarity_arr) :
+            for j, sim in enumerate(sim_arr_for_spec_loc) :
+                if(sim > similarity_threshold and sim > top_similarity) :
+                    top_similarity = sim
+                    spec_loc = locations_list[gen_loc][i][0]
+                    spec_loc_index = i
+                    spec_loc_img_name_index = j
+        
+        if spec_loc == "close door" :
+        #if spec_loc != "" :
+            # steps to calc scenario
+            # take out the five possible teammate dot colors from minimap
+            # compare that image to image with only the area in question
+            # compute overlap between images
+            # if above a certain level, indicates teammate/enemy count in that area
+            
+            image_to_check_extracted_teammates = np.array(extract_teammates(image_to_check))
+            image_to_check_extracted_enemies = np.array(extract_enemies(image_to_check))
+            #print("DEBUG: checking all scenarios in this folder: " + cur_path)
+            for scenario_id in ["a", "b", "c", "d", "e", "f"] :    
+                #print("DEBUG: checking similarity to : ./game_data/locations/{}/{}/{}/scenarios/{}/{}".format(cur_map, "Outside Long", spec_loc, locations_list["Outside Long"][spec_loc_index][2][spec_loc_img_name_index], scenario_name))
+                if(scenario_id not in locations_list[gen_loc][spec_loc_index][3][locations_list[gen_loc][spec_loc_index][2][spec_loc_img_name_index]]) :
+                    continue
+                scenarios[scenario_id] = {
+                    "teammate_count" : 0,
+                    "enemy_count" : 0,
+                }
+                scenario_area_image = locations_list[gen_loc][spec_loc_index][3][locations_list[gen_loc][spec_loc_index][2][spec_loc_img_name_index]][scenario_id] #load_image_from_file("./game_data/locations/{}/{}/{}/scenarios/{}/{}".format(cur_map, gen_loc, spec_loc, locations_list[gen_loc][spec_loc_index][2][spec_loc_img_name_index], scenario_file_name))
+                extracted_teammate_to_scenario_similarity = calc_white_overlap(image_to_check_extracted_teammates, scenario_area_image)
+                extracted_enemy_to_scenario_similarity = calc_white_overlap(image_to_check_extracted_enemies, scenario_area_image)
+                
+                #print("DEBUG: Similarity: " + str(extracted_teammate_to_scenario_similarity))
+                if extracted_teammate_to_scenario_similarity == 1 :  #not entirely sure about y this happens, but it seems to go to 1 when no temmates r present
+                    scenarios[scenario_id]["teammate_count"] = 0                
+                elif extracted_teammate_to_scenario_similarity > teammate_minimap_threshold[4] :
+                    scenarios[scenario_id]["teammate_count"] = 4
+                elif extracted_teammate_to_scenario_similarity > teammate_minimap_threshold[3] :
+                    scenarios[scenario_id]["teammate_count"] = 3
+                elif extracted_teammate_to_scenario_similarity > teammate_minimap_threshold[2] :
+                    scenarios[scenario_id]["teammate_count"] = 2
+                elif extracted_teammate_to_scenario_similarity > teammate_minimap_threshold[1] :
+                    scenarios[scenario_id]["teammate_count"] = 1
+                else :
+                    scenarios[scenario_id]["teammate_count"] = 0
+
+
+                #print("DEBUG: Similarity: " + str(extracted_enemy_to_scenario_similarity))
+                if extracted_enemy_to_scenario_similarity < enemy_minimap_threshold[0] : 
+                    scenarios[scenario_id]["enemy_count"] = 0                
+                elif extracted_enemy_to_scenario_similarity > enemy_minimap_threshold[4] :
+                    scenarios[scenario_id]["enemy_count"] = 4
+                elif extracted_enemy_to_scenario_similarity > enemy_minimap_threshold[3] :
+                    scenarios[scenario_id]["enemy_count"] = 3
+                elif extracted_enemy_to_scenario_similarity > enemy_minimap_threshold[2] :
+                    scenarios[scenario_id]["enemy_count"] = 2
+                elif extracted_enemy_to_scenario_similarity > enemy_minimap_threshold[1] :
+                    scenarios[scenario_id]["enemy_count"] = 1
+                else :
+                    # at least one question mark
+                    scenarios[scenario_id]["enemy_count"] = .5
+        return jsonify(
+            spec_loc=spec_loc,
+            scenarios=scenarios
+        )
+    except Exception as e: 
+        # general location is not valid
+        #print("EXCEPTION (INVALID LOCATION?): ")
+        #print(e)
+        app.logger.debug("error")
+        return jsonify(
+            spec_loc="",
+            scenarios=scenarios
+        )
+
+if __name__ != "__main__":
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    app.logger.handlers = gunicorn_logger.handlers
+    app.logger.setLevel(gunicorn_logger.level)
+
+if __name__ == "__main__":
+    app.debug = True
+    app.run()
+

@@ -1,0 +1,339 @@
+{--
+create a new pool on validator : add currency info to datum, mint all pool tokens, maybe only do this if dao tokens vote for it
+add an nft to a pool           : lock nft to script, script to send pool token (validates nft was locked, pool token was released)
+pull nft from pool             : lock pool token to script, script to send nft (validates token was locked, nft was released)
+concurrency ideas: set up multiple pools with an even split of the tokens
+
+TODO: might need to add something to collect dust back, when only one nft left - tracking of how much every pubkeyhash owns could help, could also be used to airdrop tokens fairly
+TODO: concurrency?
+TODO: random numbers?
+
+
+TODO: take out fee
+TODO: pull, make evil
+TODO: accept multiple tokens in one transaction
+TODO: withdraw funds
+TODO: voting
+TODO: add extra checks to contracts
+TODO: set up pab
+TODO: set up website - view pools, deposit nft, retrieve nft, links for other info
+TODO: release
+--}
+
+import           Control.Lens             (view)
+import           Control.Monad                     (void, when)
+import qualified Data.Map                          as Map
+import qualified Data.Text                         as T
+import           Plutus.Contract                   as Contract
+import qualified PlutusTx                          as PlutusTx
+import           PlutusTx.Prelude                  hiding (Semigroup (..), fold)
+import qualified PlutusTx.AssocMap                 as AssocMap
+import qualified Plutus.Contracts.Currency         as Currency
+import           Ledger                            
+import           Ledger.Constraints                (TxConstraints, mustPayToTheScript)
+import           Ledger.Contexts                   
+import qualified Ledger.Contexts                   as Validation
+import qualified Ledger.Tx                         as Tx
+import qualified Ledger.Typed.Scripts              as Scripts
+import           Ledger.Value                      as Value
+import           Playground.Contract
+import           Prelude                           (Semigroup (..), String, toInteger, show)
+import           Wallet.Emulator.Types             (walletPubKey)
+import           Text.Printf                       (printf)
+import           GHC.Generics                      (Generic)
+
+{-# INLINABLE findOwnInput' #-}
+findOwnInput' :: ScriptContext -> TxInInfo
+findOwnInput' ctx = fromMaybe (error ()) (findOwnInput ctx)
+
+{-# INLINABLE valueWithin #-}
+valueWithin :: TxInInfo -> Value
+valueWithin = txOutValue . txInInfoResolved
+
+data NFTPool = NFTPool
+    { 
+      nftCurrency              :: !CurrencySymbol
+    , poolAssetClass           :: !AssetClass
+    , poolIdentifierAssetClass :: !AssetClass
+    --, govValHash               :: !ValidatorHash        
+    } deriving (Show, Generic, ToJSON, FromJSON, ToSchema)
+
+PlutusTx.makeLift ''NFTPool
+
+data PoolRedeemer = 
+    AddNFT      { nftTokenName :: !TokenName } | 
+    RetrieveNFT { nftTokenName :: !TokenName }
+    deriving Show
+
+PlutusTx.unstableMakeIsData ''PoolRedeemer
+PlutusTx.makeLift ''PoolRedeemer
+
+{-# INLINABLE nftPoolValidator #-}
+nftPoolValidator :: NFTPool -> () -> PoolRedeemer -> ScriptContext -> Bool
+nftPoolValidator nftp _ r ctx = 
+    inputIsJunk ||
+    traceIfFalse "identifier token missing from output" outputHasIdentifierToken      &&    
+    traceIfFalse "missing nfts in output"               allOtherNFTValuesRemainLocked &&
+    case r of
+        AddNFT{..}  ->  
+                        traceIfFalse "nft already locked to contract"       nftNotAlreadyLocked           && 
+                        traceIfFalse "correct nft value not recieved"       correctNFTValueLocked         && 
+                        traceIfFalse "wrong amount of pool tokens spent"    correctPoolTokenValueReleased &&  
+                        traceIfFalse "no pool tokens available for swap"    nonNegativePoolTokensLocked               
+        RetrieveNFT{..}        ->  
+                        traceIfFalse "nft not found in locked pool"         nftAlreadyLocked              && 
+                        traceIfFalse "correct nft value not released"       correctNFTValueReleased       && 
+                        traceIfFalse "wrong amount of pool tokens locked"   correctPoolTokenValueLocked              
+
+    where
+        info :: TxInfo
+        info = scriptContextTxInfo ctx
+
+        ownInput :: TxInInfo
+        ownInput = findOwnInput' ctx
+
+        nftAC :: AssetClass
+        nftAC = assetClass (nftCurrency nftp) (nftTokenName r)
+
+        poolAC :: AssetClass
+        poolAC = poolAssetClass nftp
+
+        ownInVal, ownOutVal, valueOfCorrectNFT, valueOfCorrectPoolTokens :: Value
+        ownInVal                 = valueWithin ownInput
+        ownOutVal                = sum $ map txOutValue (getContinuingOutputs ctx)
+        valueOfCorrectNFT        = assetClassValue nftAC  1
+        valueOfCorrectPoolTokens = assetClassValue poolAC 1
+
+        convertTokenNamesToValuesOf :: [TokenName] -> [Integer]
+        convertTokenNamesToValuesOf = map getNFTValByTokenName
+
+        getNFTValByTokenName :: TokenName -> Integer
+        getNFTValByTokenName tn = assetClassValueOf ownInVal (assetClass (nftCurrency nftp) tn)
+
+        getNFTTokenNames :: Value -> [TokenName]
+        getNFTTokenNames (Value mp) =
+            case AssocMap.lookup (nftCurrency nftp) mp of
+                Nothing -> [] :: [TokenName]
+                Just i  -> AssocMap.keys i
+
+        tnNotEqSpecified :: TokenName -> Bool
+        tnNotEqSpecified tn = (nftTokenName r) /= tn
+
+        inputIsJunk, outputHasIdentifierToken, allOtherNFTValuesRemainLocked, nftNotAlreadyLocked, correctNFTValueLocked, correctPoolTokenValueReleased, nonNegativePoolTokensLocked, nftAlreadyLocked, correctNFTValueReleased, correctPoolTokenValueLocked :: Bool
+        inputIsJunk                                 = assetClassValueOf ownInVal  (poolIdentifierAssetClass nftp) == 0 -- if the contract doesn't hold the official identifier token, the script value can be spent without validation --((assetClassValueOf ownInVal poolAC) == 0 && (assetClassValueOf ownInVal nftAC) == 0) -- if the contract is just locking junk, it can be spent
+        outputHasIdentifierToken                    = assetClassValueOf ownOutVal (poolIdentifierAssetClass nftp) == 1
+        allOtherNFTValuesRemainLocked               = convertTokenNamesToValuesOf (filter tnNotEqSpecified $ getNFTTokenNames ownInVal) == convertTokenNamesToValuesOf (filter tnNotEqSpecified $ getNFTTokenNames ownOutVal) --check if all inputs' tokens' amounts of the nft currency values' are the same as the outputs'
+        
+        -- add checks --
+        nftNotAlreadyLocked                         = assetClassValueOf ownInVal  nftAC == 0  -- DUPLICATE CHECK IF WANTED
+        correctNFTValueLocked                       = assetClassValueOf ownOutVal nftAC == 1 
+        correctPoolTokenValueReleased               = ((assetClassValueOf ownInVal poolAC) - 1) == assetClassValueOf ownOutVal poolAC 
+        nonNegativePoolTokensLocked                 = (assetClassValueOf ownOutVal poolAC) >= 0
+        -- retrieve checks --
+        nftAlreadyLocked                            = assetClassValueOf ownInVal  nftAC == 1
+        correctNFTValueReleased                     = assetClassValueOf ownOutVal nftAC == 0
+        correctPoolTokenValueLocked                 = ((assetClassValueOf ownInVal poolAC) + 1) == assetClassValueOf ownOutVal poolAC 
+        correctFeePaid                              = True --sum $ map txOutValue (scriptOutputsAt (govValHash nftp) info)
+        
+
+nftPoolAddress :: NFTPool -> Ledger.Address
+nftPoolAddress = Scripts.validatorAddress . nftPoolInstance
+
+data Pooling
+instance Scripts.ValidatorTypes Pooling where
+    type instance RedeemerType Pooling = PoolRedeemer
+    type instance DatumType Pooling = ()
+
+nftPoolInstance :: NFTPool -> Scripts.TypedValidator Pooling
+nftPoolInstance = Scripts.mkTypedValidatorParam @Pooling
+    $$(PlutusTx.compile [|| nftPoolValidator ||])
+    $$(PlutusTx.compile [|| wrap ||])
+  where
+    wrap = Scripts.wrapValidator 
+
+
+---OFFCHAIN STUFF---
+data CreateParams = CreateParams
+    { 
+      createPoolNFTCur                :: !CurrencySymbol
+    , createPoolTokenName             :: !TokenName
+    , createPoolIdentifierTokenName   :: !TokenName
+    , tokenSupply                     :: !Integer
+    } deriving (Generic, ToJSON, FromJSON, ToSchema)
+
+data AddParams = AddParams
+    { 
+      addPool  :: !NFTPool
+    , addNFTTN :: !TokenName
+    } deriving (Generic, ToJSON, FromJSON, ToSchema)
+
+data RetrieveParams = RetrieveParams
+    { 
+      retrievePool  :: !NFTPool
+    , retrieveNFTTN :: !TokenName
+    } deriving (Generic, ToJSON, FromJSON, ToSchema)
+
+type NFTPoolSchema =
+            Endpoint "create" CreateParams
+        .\/ Endpoint "add" AddParams
+        .\/ Endpoint "retrieve" RetrieveParams
+        .\/ Endpoint "createEvil" CreateParams
+        .\/ Endpoint "addEvil" AddParams
+
+contract :: Contract () NFTPoolSchema T.Text ()
+--contract = selectList [create, add, retrieve] >> contract
+contract = selectList [create, add, retrieve, createEvil, addEvil] >> contract
+
+create :: Promise () NFTPoolSchema T.Text () -- create validator for pool, mint pool tokens and an identifier token, send minted tokens to script
+create = endpoint @"create" $ \CreateParams{..} -> do 
+    pkh <- pubKeyHash <$> Contract.ownPubKey
+    osc <- mapError (T.pack . show) (Currency.mintContract pkh [(createPoolIdentifierTokenName, 1), (createPoolTokenName, tokenSupply)] :: Contract w s Currency.CurrencyError Currency.OneShotCurrency)
+    let
+        cs     = Currency.currencySymbol osc
+        
+        nftp = NFTPool {
+          nftCurrency              = createPoolNFTCur
+        , poolAssetClass           = assetClass cs createPoolTokenName
+        , poolIdentifierAssetClass = assetClass cs createPoolIdentifierTokenName
+        --, govValHash               = "4e9941283ce23252a4b625079150da4c2da7588f00389a07e2bc17f1"
+        }
+
+        poolIdentifierValue = assetClassValue (poolIdentifierAssetClass nftp) 1
+        poolTokenFullSupplyValue = assetClassValue (poolAssetClass nftp) tokenSupply
+        tx = mustPayToTheScript () (poolIdentifierValue + poolTokenFullSupplyValue)
+    ledgerTx <- submitTxConstraints (nftPoolInstance nftp) tx     
+    void $ awaitTxConfirmed $ txId ledgerTx
+    logInfo @String $ printf "added to %s tokens %s" (show nftp) (show poolTokenFullSupplyValue)
+
+
+add :: Promise () NFTPoolSchema T.Text ()
+add = endpoint @"add" $ \AddParams{..} -> do
+    unspentOutputs <- utxosAt (nftPoolAddress addPool)
+    let 
+        nftValue = assetClassValue (assetClass (nftCurrency addPool) addNFTTN) 1
+        withdrawalPoolTokenValue = assetClassValue (poolAssetClass addPool) 1
+        currentlyLockedValue = foldMap (view Tx.ciTxOutValue) (Map.elems unspentOutputs)    
+        mustRemainLockedValue = currentlyLockedValue - withdrawalPoolTokenValue
+
+        -- TODO: check if values are valid 
+        
+        redeemer = AddNFT { nftTokenName = addNFTTN }
+        tx = 
+            mustPayToTheScript () (nftValue + mustRemainLockedValue)     <>
+            collectFromScript unspentOutputs redeemer
+    ledgerTx <- submitTxConstraintsSpending (nftPoolInstance addPool) unspentOutputs tx 
+    void $ awaitTxConfirmed $ txId ledgerTx
+    logInfo @String $ printf "added %s %s" (show addPool) (show nftValue)
+
+retrieve :: Promise () NFTPoolSchema T.Text ()
+retrieve = endpoint @"retrieve" $ \RetrieveParams{..} -> do
+    unspentOutputs <- utxosAt (nftPoolAddress retrievePool)
+    let 
+        nftValue = assetClassValue (assetClass (nftCurrency retrievePool) retrieveNFTTN) 1
+        returnPoolTokenValue = assetClassValue (poolAssetClass retrievePool) 1
+        currentlyLockedValue = foldMap (view Tx.ciTxOutValue) (Map.elems unspentOutputs)    
+        mustRemainLockedValue = currentlyLockedValue - nftValue
+
+        -- TODO: check if values are valid 
+        
+        redeemer = RetrieveNFT { nftTokenName = retrieveNFTTN }
+        tx = 
+            mustPayToTheScript () (returnPoolTokenValue + mustRemainLockedValue)     <>
+            collectFromScript unspentOutputs redeemer
+    ledgerTx <- submitTxConstraintsSpending (nftPoolInstance retrievePool) unspentOutputs tx 
+    void $ awaitTxConfirmed $ txId ledgerTx
+    logInfo @String $ printf "retrieved %s %s" (show retrievePool) (show nftValue)
+
+endpoints :: Contract () NFTPoolSchema T.Text ()
+endpoints = contract
+
+
+
+
+--Hacking
+--add random junk to contract script address
+createEvil :: Promise () NFTPoolSchema T.Text () -- create validator for pool, mint pool tokens and an identifier token, send minted tokens to script
+createEvil = endpoint @"createEvil" $ \CreateParams{..} -> do 
+    let
+        nftp = NFTPool {
+          nftCurrency              = createPoolNFTCur
+        , poolAssetClass           = assetClass "1c91c6c495b5489b22a7a9070840ab206846af506709b269c6e81f4e" createPoolTokenName
+        , poolIdentifierAssetClass = assetClass "1c91c6c495b5489b22a7a9070840ab206846af506709b269c6e81f4e" createPoolIdentifierTokenName
+        --, govValHash               = "4e9941283ce23252a4b625079150da4c2da7588f00389a07e2bc17f1"
+        }
+
+        tx = mustPayToTheScript () (Value.singleton "65" (TokenName "poolt") 10)
+    ledgerTx <- submitTxConstraints (nftPoolInstance nftp) tx     
+    void $ awaitTxConfirmed $ txId ledgerTx
+
+--add bad nft
+addEvil :: Promise () NFTPoolSchema T.Text ()
+addEvil = endpoint @"addEvil" $ \AddParams{..} -> do
+    unspentOutputs <- utxosAt (nftPoolAddress addPool)
+    let 
+        nftValue = assetClassValue (assetClass (nftCurrency addPool) addNFTTN) 1
+        withdrawalPoolTokenValue = assetClassValue (poolAssetClass addPool) 1
+        currentlyLockedValue = foldMap (view Tx.ciTxOutValue) (Map.elems unspentOutputs)    
+        mustRemainLockedValue = currentlyLockedValue - withdrawalPoolTokenValue
+
+        -- TODO: check if values are valid 
+        
+        redeemer = AddNFT { nftTokenName = addNFTTN }
+        tx = 
+            mustPayToTheScript () (nftValue + mustRemainLockedValue)     <>
+            collectFromScript unspentOutputs redeemer
+    ledgerTx <- submitTxConstraintsSpending (nftPoolInstance addPool) unspentOutputs tx 
+    void $ awaitTxConfirmed $ txId ledgerTx
+    logInfo @String $ printf "added %s %s" (show addPool) (show nftValue)
+
+
+
+
+
+
+
+
+
+mkSchemaDefinitions ''NFTPoolSchema
+
+nft :: KnownCurrency
+nft = KnownCurrency (ValidatorHash "f") "NFT" (TokenName "nft" :| [])
+
+nft2 :: KnownCurrency
+nft2 = KnownCurrency (ValidatorHash "f") "NFT2" (TokenName "nft2" :| [])
+
+thePoolToken :: KnownCurrency
+thePoolToken = KnownCurrency (ValidatorHash "e") "PoolToken" (TokenName "poolt" :| [])
+
+poolIdentifier :: KnownCurrency
+poolIdentifier = KnownCurrency (ValidatorHash "b") "PoolIdentifier" (TokenName "pooli" :| [])
+
+unsigs :: KnownCurrency
+unsigs = KnownCurrency (ValidatorHash "d") "unsig1" (TokenName "unsig1" :| [])
+
+unsigsPoolToken :: KnownCurrency
+unsigsPoolToken = KnownCurrency (ValidatorHash "c") "unsigt" (TokenName "unsigt" :| [])
+
+unsigPoolIdentifier :: KnownCurrency
+unsigPoolIdentifier = KnownCurrency (ValidatorHash "a") "UnsigPoolIdentifier" (TokenName "unsigi" :| [])
+
+$(mkKnownCurrencies ['nft,'thePoolToken,'nft2,'unsigs,'unsigsPoolToken])
+
+
+
+--traceIfFalse "incorrect amount of tokens swapped"                correctAddSwapMade             &&
+--traceIfFalse "no pool tokens remaining to be swapped"            nonNegativePoolTokensRemaining
+
+
+ --
+        --valueOf (Value mp) cur tn =
+        --    case Map.lookup cur mp of
+        --        Nothing -> 0 :: Integer
+        --        Just i  -> 
+        
+        --ownInValCondensed = ownInVal + valueOfCorrectNFT
+
+        {--correctAddSwapMade, nonNegativePoolTokensRemaining :: Bool
+        correctAddSwapMade = ((ownInVal + valueOfCorrectNFT)) == (ownOutVal + valueOfCorrectPoolTokens)
+        nonNegativePoolTokensRemaining = (assetClassValueOf ownOutVal (poolAssetClass nftp)) >= 0--}
+

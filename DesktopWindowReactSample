@@ -1,0 +1,346 @@
+import { OverwolfWindow, WindowTunnel } from 'ow-libs';
+import { useState, useEffect, useMemo } from 'react';
+import { CSSTransition } from 'react-transition-group';
+import semver from 'semver';
+
+import { DesktopWindowHeader } from '../DesktopWindowHeader/DesktopWindowHeader';
+import { MyTips } from '../MyTips/MyTips';
+import { SavedTips } from '../SavedTips/SavedTips';
+import { DiscoverTips } from '../DiscoverTips/DiscoverTips';
+import { CoachesPage } from '../CoachesPage/CoachesPage';
+import { HighlightsPage } from '../HighlightsPage/HighlightsPage';
+import { RecsPage } from '../RecsPage/RecsPage';
+import { Welcome } from '../Welcome/Welcome';
+import { Settings } from '../Settings/Settings';
+import { FAQ } from '../FAQ/FAQ';
+import { FeedbackPopup } from '../FeedbackPopup/FeedbackPopup';
+import { ContributePopup } from '../ContributePopup/ContributePopup';
+import { NotLoggedIn } from '../NotLoggedIn/NotLoggedIn';
+import { PatchNotes } from '../PatchNotes/PatchNotes';
+import { Ad } from '../Ad/Ad';
+
+import { useTips } from '../../hooks/use-tips';
+import { usePersState } from '../../hooks/use-pers-state';
+import { useCommonState } from '../../hooks/use-common-state';
+import { useAppVersion } from '../../hooks/use-app-version';
+import { useSubscription } from '../../hooks/use-subscription';
+
+import { kEventBusName, kEventPatchNotesRead, kEventSetDesktopWindowPositioned, kEventScreenOpened } from '../../services/event-bus';
+import { kDiscordURL, kYouTubeURL, kSubscriptionsEnabled } from '../../constants/app-config';
+
+import { classNames } from '../../utils';
+
+import './DesktopWindow.scss';
+import { Stats } from '../Stats/Stats';
+import { SecondSuggestedTips } from '../SecondSuggestedTips/SecondSuggestedTips';
+import { SecondIngameTips } from '../SecondIngameTips/SecondIngameTips';
+import { L } from 'ow-libs/dist/utils';
+
+const eventBus = WindowTunnel.get(kEventBusName);
+
+export const kDesktopWindowScreens = {
+  My: 'My',
+  Saved: 'Saved',
+  Settings: 'Settings',
+  FAQ: 'FAQ',
+  Discover: 'Discover',
+  Recs: 'Recs',
+  Coaches: 'Coaches',
+  Stats: 'Stats',
+  Highlights: 'Highlights',
+  Live: 'Live',
+  Suggested: 'Suggested'
+};
+
+export const kDesktopWindowPopups = {
+  Feedback: 'Feedback',
+  Contribute: 'Contribute',
+  PatchNotes: 'PatchNotes'
+};
+
+// desktop window can be used as base for other windows, this variable specifies the window and allows for customizationof the base desktop window
+// Matches to the ID used for the alternate window
+export const kDesktopWindowAltWindows = {
+  Second: 'second',
+  SecondLobby: 'secondlobby',
+  Desktop: 'desktop'
+};
+
+export function DesktopWindow({ windowName = kDesktopWindowAltWindows.Desktop }) {
+  const [welcomeShown, setWelcomeShown] = useState(true);
+  const [popupShown, setPopupShown] = useState(null);
+  const [
+    screenSelected,
+    setScreenSelected
+  ] = useState(kDesktopWindowScreens.My);
+
+  const { ready, tipActions } = useTips();
+
+  const appVersion = useAppVersion();
+
+  const desktopWindow = new OverwolfWindow(windowName);
+
+  const { subscriptionActive } = useSubscription();
+
+  const
+    userId = usePersState('userId'),
+    isPositioned = usePersState('desktopWindowPositioned'),
+    patchNotesRead = usePersState('patchNotesRead'),
+    viewport = useCommonState('viewport'),
+    monitors = useCommonState('monitors'),
+    gameRunning = useCommonState('gameRunning'),
+    broadcastMsg = useCommonState('broadcastMsg'),
+    gepStatus = useCommonState('gepStatus'),
+    gepStatusMessage = useCommonState('gepStatusMessage');
+
+  function dragWindow() {
+    desktopWindow.dragMove();
+  }
+
+  function minimizeWindow() {
+    desktopWindow.minimize();
+  }
+
+  function closeWindow() {
+    desktopWindow.close();
+  }
+
+  function openDiscord() {
+    overwolf.utils.openUrlInDefaultBrowser(kDiscordURL);
+  }
+
+  function openYouTube() {
+    overwolf.utils.openUrlInDefaultBrowser(kYouTubeURL);
+  }
+
+  function renderContent() {
+    switch (screenSelected) {
+      case kDesktopWindowScreens.Settings:
+        return <Settings />;
+      case kDesktopWindowScreens.FAQ:
+        return <FAQ onOpenPopup={popup => setPopupShown(popup)} />;
+    }
+
+    if (screenSelected === kDesktopWindowScreens.Discover) {
+      return <DiscoverTips />;
+    }
+
+    if (screenSelected === kDesktopWindowScreens.Recs) {
+      return <RecsPage />;
+    }
+
+    if (screenSelected === kDesktopWindowScreens.Coaches) {
+      return <CoachesPage />;
+    }
+
+    if (screenSelected === kDesktopWindowScreens.Stats) {
+      return <Stats />;
+    }
+
+    if (screenSelected === kDesktopWindowScreens.Highlights) {
+      return <HighlightsPage />;
+    }
+
+    if (!userId) {
+      return <NotLoggedIn onOpenPopup={popup => setPopupShown(popup)} window="desktop" />;
+    }
+
+    switch (screenSelected) {
+      case kDesktopWindowScreens.My:
+        return <MyTips onOpenPopup={popup => setPopupShown(popup)} />;
+      case kDesktopWindowScreens.Live:
+        return <SecondIngameTips />;
+      case kDesktopWindowScreens.Suggested:
+        return <SecondSuggestedTips />;
+      case kDesktopWindowScreens.Saved:
+        return <SavedTips />;
+    }
+  }
+
+  function closePatchNotes() {
+    eventBus.emit(kEventPatchNotesRead, appVersion);
+    setPopupShown(null);
+  }
+
+  function newScreenOpened(selected) {
+    eventBus.emit(kEventScreenOpened, selected);
+  }
+
+  const patchNotesNew = useMemo(() => {
+    if (
+      appVersion &&
+      (!patchNotesRead || semver.gt(appVersion, patchNotesRead))
+    ) {
+      return true;
+    }
+
+    return false;
+  }, [appVersion, patchNotesRead]);
+
+  useEffect(async () => {
+    async function maybePositionWindow() {
+      if (
+        !isPositioned ||
+        isPositioned.width !== viewport.width ||
+        isPositioned.height !== viewport.height ||
+        isPositioned.scale !== viewport.scale
+      ) {
+        await desktopWindow.center();
+        eventBus.emit(kEventSetDesktopWindowPositioned, viewport);
+      }
+    }
+
+    async function positionWindowSecondScreen() {
+      if (!monitors || !monitors.length) {
+        return;
+      }
+
+      const
+        winWidth = 1335,
+        winHeight = 750;
+
+      let
+        monitor = monitors[0],
+        monitorSize = 0;
+
+      // by default selects the largest non-primary monitor
+      for (const v of monitors) {
+        if (
+          !v.is_primary &&
+          ((v.width * v.height) > monitorSize)
+        ) {
+          monitor = v;
+          monitorSize = v.width * v.height;
+        }
+      }
+
+      if (!monitor) return;
+
+      const
+        scale = monitor.dpiX / 96,
+        monitorLogicalWidth = monitor.width / scale,
+        monitorLogicalHeight = monitor.height / scale;
+
+      let
+        left = monitor.x + (monitorLogicalWidth / 2) - (winWidth / 2) - (450 / 2), // centered + to the left of the agent select window by 10, todo: use a shared width variable
+        top = monitor.y + (monitorLogicalHeight / 2) - (winHeight / 2);
+
+      left = Math.max(left, monitor.x);
+      top = Math.max(top, monitor.y);
+
+      left = Math.floor(left);
+      top = Math.floor(top);
+
+      await desktopWindow.changePosition(left, top);
+
+      console.log('positionWindow()', ...L(monitor));
+    }
+
+    switch (windowName) {
+      case kDesktopWindowAltWindows.Desktop:
+        maybePositionWindow();
+        break;
+      case kDesktopWindowAltWindows.Second:
+      case kDesktopWindowAltWindows.SecondLobby:
+        await positionWindowSecondScreen();
+        desktopWindow.bringToFront(false);
+        break;
+    }
+
+    setTimeout(() => setWelcomeShown(false), 2000);
+  }, [viewport, isPositioned, monitors]);
+
+  useEffect(() => {
+    return () => {
+      if (ready && !gameRunning) {
+        tipActions.setAllSeen();
+      }
+    };
+  }, [gameRunning, ready, tipActions]);
+
+  useEffect(() => {
+    switch (windowName) {
+      case kDesktopWindowAltWindows.Desktop:
+        setScreenSelected(kDesktopWindowScreens.My);
+        break;
+      case kDesktopWindowAltWindows.Second:
+        setScreenSelected(kDesktopWindowScreens.Live);
+        break;
+      case kDesktopWindowAltWindows.SecondLobby:
+        setScreenSelected(kDesktopWindowScreens.Suggested);
+        break;
+    }
+  }, []);
+
+  return (
+    <main className={classNames(
+      'desktop-window',
+      {
+        premium: subscriptionActive,
+        'subscriptions-enabled': kSubscriptionsEnabled
+      }
+    )}>
+      <DesktopWindowHeader
+        screenSelected={screenSelected}
+        newPatchNotes={patchNotesNew}
+        broadcastMsg={(gepStatus === 1 || gepStatus === 2) ? broadcastMsg : gepStatusMessage} // TODO4: added status 2 to working
+        gepStatus={gepStatus}
+        onOpenPatchNotes={() => setPopupShown(kDesktopWindowPopups.PatchNotes)}
+        onOpenDiscord={openDiscord}
+        onOpenYouTube={openYouTube}
+        onWindowDrag={dragWindow}
+        onWindowMinimize={minimizeWindow}
+        onWindowClose={closeWindow}
+        onScreenSelected={selected => { setScreenSelected(selected); newScreenOpened(selected); }}
+        windowName={windowName}
+      />
+
+      {renderContent()}
+
+      <Ad
+        enabled={ready}
+        windowName={windowName}
+      />
+
+      <CSSTransition
+        in={welcomeShown || !ready}
+        classNames="welcome"
+        timeout={250}
+        unmountOnExit={true}
+      >
+        <Welcome onWindowDrag={dragWindow} />
+      </CSSTransition>
+
+      <CSSTransition
+        in={popupShown === kDesktopWindowPopups.Feedback}
+        classNames="feedback-popup"
+        timeout={250}
+        mountOnEnter={true}
+        unmountOnExit={true}
+      >
+        <FeedbackPopup onClose={() => setPopupShown(null)} />
+      </CSSTransition>
+
+      <CSSTransition
+        in={popupShown === kDesktopWindowPopups.Contribute}
+        classNames="feedback-popup"
+        timeout={250}
+        mountOnEnter={true}
+        unmountOnExit={true}
+      >
+        <ContributePopup onClose={() => setPopupShown(null)} />
+      </CSSTransition>
+
+      <CSSTransition
+        in={popupShown === kDesktopWindowPopups.PatchNotes}
+        classNames="patch-notes"
+        timeout={250}
+        mountOnEnter={true}
+        unmountOnExit={true}
+      >
+        <PatchNotes onClose={closePatchNotes} />
+      </CSSTransition>
+    </main>
+  );
+}
+
